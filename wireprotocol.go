@@ -150,6 +150,10 @@ func newWireProtocolContext(ctx context.Context, addr string, timezone string, c
 	}
 
 	p.conn, err = newWireChannel(conn)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
 	p.timezone = timezone
 	p.charset = charset
 	p.charsetLen()

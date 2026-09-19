@@ -154,10 +154,27 @@ func (fc *firebirdsqlConn) Query(query string, args []driver.Value) (rows driver
 }
 
 func openFirebirdsqlConn(dsn *firebirdDsn, dbOp func(*wireProtocol) error) (*firebirdsqlConn, error) {
-	wp, err := newWireProtocol(dsn.addr, dsn.options["timezone"], dsn.options["charset"])
+	return openFirebirdsqlConnContext(context.Background(), dsn, dbOp)
+}
+
+func openFirebirdsqlConnContext(ctx context.Context, dsn *firebirdDsn, dbOp func(*wireProtocol) error) (fc *firebirdsqlConn, err error) {
+	wp, err := newWireProtocolContext(ctx, dsn.addr, dsn.options["timezone"], dsn.options["charset"])
 	if err != nil {
 		return nil, err
 	}
+	// On every failure, close the transport directly: detach itself can block
+	// when authentication or attach has not finished. This runs after finish.
+	defer func() {
+		if err != nil {
+			wp.conn.conn.Close()
+			fc = nil
+		}
+	}()
+	finish, err := watchConnectionContext(ctx, wp.conn.conn)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = finish(err) }()
 	columnNameToLower := convertToBool(dsn.options["column_name_to_lower"], false)
 	clientPublic, clientSecret, err := getClientSeed()
 	if err != nil {
@@ -185,7 +202,7 @@ func openFirebirdsqlConn(dsn *firebirdDsn, dbOp func(*wireProtocol) error) (*fir
 		return nil, err
 	}
 
-	fc := &firebirdsqlConn{
+	fc = &firebirdsqlConn{
 		transactionSet:    make(map[*firebirdsqlTx]struct{}),
 		wp:                wp,
 		dsn:               dsn,
@@ -202,7 +219,11 @@ func openFirebirdsqlConn(dsn *firebirdDsn, dbOp func(*wireProtocol) error) (*fir
 }
 
 func attachFirebirdsqlConn(dsn *firebirdDsn) (*firebirdsqlConn, error) {
-	return openFirebirdsqlConn(dsn, func(wp *wireProtocol) error {
+	return attachFirebirdsqlConnContext(context.Background(), dsn)
+}
+
+func attachFirebirdsqlConnContext(ctx context.Context, dsn *firebirdDsn) (*firebirdsqlConn, error) {
+	return openFirebirdsqlConnContext(ctx, dsn, func(wp *wireProtocol) error {
 		return wp.opAttach(dsn.dbName, dsn.user, dsn.passwd, dsn.options["role"])
 	})
 }
