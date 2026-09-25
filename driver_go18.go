@@ -87,6 +87,14 @@ func (fc *firebirdsqlConn) ExecContext(ctx context.Context, query string, nameda
 	return fc.exec(ctx, query, flattenNamedValues(namedargs))
 }
 
+// Test hooks for the Ping watcher goroutine: Start runs before it selects,
+// Exit when it returns. Always nil outside tests (only _test.go files assign
+// them), so production pays one nil check each and nothing else changes.
+var (
+	testHookPingWatcherStart func(ctx context.Context)
+	testHookPingWatcherExit  func()
+)
+
 // isc_info_ods_version chosen over isc_info_ping for FB 2.5 compatibility (Jaybird does the same).
 var pingInfoItems = []byte{isc_info_ods_version, isc_info_end}
 
@@ -98,21 +106,8 @@ func (fc *firebirdsqlConn) Ping(ctx context.Context) (err error) {
 	}
 
 	if ctx.Done() != nil {
-		completed := make(chan struct{})
-		defer close(completed)
-
-		if d, ok := ctx.Deadline(); ok {
-			defer fc.wp.conn.SetDeadline(time.Time{})
-			_ = fc.wp.conn.SetDeadline(d)
-		}
-
-		go func() {
-			select {
-			case <-ctx.Done():
-				_ = fc.wp.conn.SetDeadline(time.Now())
-			case <-completed:
-			}
-		}()
+		finish := watchPing(ctx, &fc.wp.conn)
+		defer func() { err = finish(err) }()
 	}
 
 	if err = fc.wp.opInfoDatabase(pingInfoItems); err != nil {
@@ -120,10 +115,11 @@ func (fc *firebirdsqlConn) Ping(ctx context.Context) (err error) {
 	}
 
 	if _, _, _, err = fc.wp.opResponse(); err != nil {
-		if errors.Is(err, os.ErrDeadlineExceeded) {
+		if _, hasDeadline := ctx.Deadline(); hasDeadline && errors.Is(err, os.ErrDeadlineExceeded) {
 			// ctx is the source of truth. The OS conn deadline can fire a hair
 			// before the ctx timer at the same deadline instant; wait so the
-			// ctx.Err() check below sees the populated cause.
+			// ctx.Err() check below sees the populated cause. Only with a ctx
+			// deadline: without one, Done may be nil and would block forever.
 			<-ctx.Done()
 		}
 
@@ -133,6 +129,51 @@ func (fc *firebirdsqlConn) Ping(ctx context.Context) (err error) {
 		return fmt.Errorf("ping response failed: %w: %w", err, driver.ErrBadConn)
 	}
 	return nil
+}
+
+// watchPing arms the cancellation watcher for one Ping round-trip. finish must
+// run exactly once, when the round-trip is over, with its error. It stops the
+// watcher and waits for it to exit before clearing the deadline: database/sql
+// puts the connection back in the pool as soon as Ping returns, and a watcher
+// still running could set a deadline in the past on it, failing the next
+// operation of whoever takes it with "i/o timeout".
+//
+// If ctx is done by then, the cancellation reached the round-trip and the wire
+// position is unknown: finish reports driver.ErrBadConn, so database/sql
+// discards the connection instead of reusing it.
+func watchPing(ctx context.Context, conn *wireChannel) (finish func(error) error) {
+	if d, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(d)
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if h := testHookPingWatcherExit; h != nil {
+			defer h()
+		}
+		if h := testHookPingWatcherStart; h != nil {
+			h(ctx)
+		}
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-stop:
+		}
+	}()
+	return func(opErr error) error {
+		close(stop)
+		<-done
+		cerr := ctx.Err()
+		_ = conn.SetDeadline(time.Time{})
+		if opErr != nil {
+			return opErr
+		}
+		if cerr != nil {
+			return fmt.Errorf("ping cancelled: %w: %w", cerr, driver.ErrBadConn)
+		}
+		return nil
+	}
 }
 
 func (fc *firebirdsqlConn) QueryContext(ctx context.Context, query string, namedargs []driver.NamedValue) (rows driver.Rows, err error) {
